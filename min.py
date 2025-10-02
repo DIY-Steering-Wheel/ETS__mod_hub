@@ -1,19 +1,31 @@
 import os
 import json
 import threading
-import gdown
 import zipfile
 import requests
 import shutil
 import tkinter as tk
 from tkinter import messagebox, ttk
 import time
+import tempfile
+import math
+
+# Tente importar gdown (se não existir, seguiremos com fallback)
+try:
+    import gdown
+    HAVE_GDOWN = True
+except Exception:
+    HAVE_GDOWN = False
 
 # DETECTA DOCUMENTS E ETS2
 DOCUMENTS_FOLDER = os.path.join(os.path.expanduser("~"), "Documents")
 EUROTRUCK_PATH = os.path.join(DOCUMENTS_FOLDER, "Euro Truck Simulator 2")
 MODS_FOLDER = os.path.join(EUROTRUCK_PATH, "mod")
 PROFILES_FOLDER = os.path.join(EUROTRUCK_PATH, "profiles")
+
+# Garanta que pastas existam
+os.makedirs(MODS_FOLDER, exist_ok=True)
+os.makedirs(PROFILES_FOLDER, exist_ok=True)
 
 # NOVO LINK
 JSON_URL = "https://raw.githubusercontent.com/DIY-Steering-Wheel/ETS__mod_hub/refs/heads/main/mods.json"
@@ -22,7 +34,83 @@ DOWNLOADING = False
 cancel_flag = False
 mods_list = []
 
+# --- util: detectar link google drive (simples) ---
+def is_google_drive_link(url: str) -> bool:
+    return "drive.google.com" in url or "drive.googleusercontent.com" in url
 
+# --- util: download via requests streaming com progress ---
+def download_with_requests(url, out_path, progress_callback=None, timeout=15):
+    session = requests.Session()
+    headers = {"User-Agent": "Mozilla/5.0"}
+    with session.get(url, stream=True, timeout=timeout, headers=headers) as r:
+        r.raise_for_status()
+        total = r.headers.get("content-length")
+        if total is None:
+            # sem content-length: gravar sem barra percentual confiável
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if cancel_flag:
+                        return False
+                    if chunk:
+                        f.write(chunk)
+                        if progress_callback:
+                            progress_callback(None)  # sem total
+            return True
+        else:
+            total = int(total)
+            written = 0
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if cancel_flag:
+                        return False
+                    if chunk:
+                        f.write(chunk)
+                        written += len(chunk)
+                        if progress_callback:
+                            progress_callback(written, total)
+            return True
+
+# --- util: tenta baixar com gdown ou requests com retries ---
+def robust_download(url, out_path, progress_callback=None, status_text=None, retries=3):
+    last_exception = None
+    for attempt in range(1, retries + 1):
+        try:
+            if status_text:
+                status_text.set(f"Tentativa {attempt} de {retries}...")
+                root.update_idletasks()
+
+            if is_google_drive_link(url) and HAVE_GDOWN:
+                # gdown retorna True/arquivo; usar quiet=True para não poluir
+                # gdown trata confirm prompts para arquivos grandes
+                try:
+                    gdown.download(url, out_path, quiet=True)
+                    # verifique se arquivo foi realmente criado
+                    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                        if progress_callback:
+                            # não temos total, marque 100%
+                            progress_callback(1, 1)
+                        return True
+                    else:
+                        raise RuntimeError("gdown baixou arquivo vazio.")
+                except Exception as e:
+                    last_exception = e
+                    # fallback para requests se gdown falhar
+                    if status_text:
+                        status_text.set("gdown falhou, tentando fallback com requests...")
+                    # continue para bloco requests abaixo
+            # fallback / link comum: requests streaming
+            success = download_with_requests(url, out_path, progress_callback=progress_callback)
+            if success:
+                return True
+        except Exception as e:
+            last_exception = e
+            if status_text:
+                status_text.set(f"Erro: {e}. Retentando...")
+            time.sleep(1 + attempt)  # backoff simples
+    # todas as tentativas falharam
+    raise last_exception if last_exception is not None else RuntimeError("Falha desconhecida no download.")
+
+# --- função principal de download e instalação ---
 def download_and_install(mod, status_text, modal, progress_bar, cancel_btn):
     global DOWNLOADING, cancel_flag
     if DOWNLOADING:
@@ -31,48 +119,71 @@ def download_and_install(mod, status_text, modal, progress_bar, cancel_btn):
 
     DOWNLOADING = True
     cancel_flag = False
-    temp_zip = os.path.join(os.getcwd(), "temp_mod.zip")
+
+    tmp_dir = tempfile.mkdtemp(prefix="ets2_mod_")
+    temp_zip = os.path.join(tmp_dir, "temp_mod.zip")
 
     try:
         status_text.set(f"Baixando {mod['name']}...")
         root.update_idletasks()
 
-        # Download com timeout de aviso
         start_time = time.time()
+
+        # função de callback que atualiza a progressbar a partir de bytes
+        def progress_cb(written, total):
+            if cancel_flag:
+                return
+            if total and total > 0:
+                percent = (written / total) * 100
+                progress_bar["value"] = percent
+            else:
+                # sem total conhecido: anima a barra incrementalmente
+                progress_bar.step(5)
+            root.update_idletasks()
+
         try:
-            gdown.download(mod['drive_link'], temp_zip, quiet=False)
-        except Exception:
-            status_text.set("Erro de Internet")
-            messagebox.showerror("Erro de Internet", "Não foi possível acessar o arquivo na web.")
-            modal.destroy()
+            robust_download(mod['drive_link'], temp_zip, progress_callback=progress_cb, status_text=status_text, retries=3)
+        except Exception as e:
+            status_text.set("Erro ao baixar arquivo")
+            messagebox.showerror("Erro de Download", f"Não foi possível baixar {mod['name']}.\nDetalhe: {e}")
             return
 
-        if time.time() - start_time > 10:
+        elapsed = time.time() - start_time
+        if elapsed > 10:
             status_text.set("Algumas instalações podem demorar vários minutos.\nEspere. Caso houver erros, informaremos a você.")
+            root.update_idletasks()
 
         if cancel_flag:
             status_text.set("Operação cancelada")
-            modal.destroy()
             return
 
-        # Esconde botão de cancelar
-        cancel_btn.pack_forget()
+        # Esconde botão de cancelar (opcional)
+        try:
+            cancel_btn.pack_forget()
+        except Exception:
+            pass
 
         # Extração com barra de progresso
         status_text.set("Extraindo arquivos...")
         root.update_idletasks()
         with zipfile.ZipFile(temp_zip, 'r') as zip_ref:
             file_list = zip_ref.namelist()
-            total_files = len(file_list)
+            total_files = len(file_list) if file_list else 0
             for i, file in enumerate(file_list, start=1):
-                zip_ref.extract(file, "temp_mod")
-                progress_bar["value"] = (i / total_files) * 100
+                if cancel_flag:
+                    status_text.set("Cancelando extração...")
+                    return
+                zip_ref.extract(file, tmp_dir)
+                if total_files > 0:
+                    progress_bar["value"] = (i / total_files) * 100
+                else:
+                    progress_bar.step(5)
                 root.update_idletasks()
 
-        temp_mod_path = "temp_mod"
+        temp_mod_path = os.path.join(tmp_dir, "")
 
-        # Instalar mods
-        mods_path = os.path.join(temp_mod_path, "mods")
+        # Instalar mods (procura pasta 'mods' dentro do zip)
+        mods_path = os.path.join(tmp_dir, "mods")
         if os.path.exists(mods_path):
             for item in os.listdir(mods_path):
                 s = os.path.join(mods_path, item)
@@ -83,7 +194,7 @@ def download_and_install(mod, status_text, modal, progress_bar, cancel_btn):
                     shutil.copy2(s, d)
 
         # Instalar perfis
-        perfil_path = os.path.join(temp_mod_path, "perfil")
+        perfil_path = os.path.join(tmp_dir, "perfil")
         if os.path.exists(perfil_path):
             for item in os.listdir(perfil_path):
                 s = os.path.join(perfil_path, item)
@@ -100,16 +211,24 @@ def download_and_install(mod, status_text, modal, progress_bar, cancel_btn):
         status_text.set("Ocorreu um erro")
         messagebox.showerror("Erro", f"Ocorreu um erro: {e}")
     finally:
-        if os.path.exists(temp_zip):
-            os.remove(temp_zip)
-        if os.path.exists("temp_mod"):
-            shutil.rmtree("temp_mod", ignore_errors=True)
+        # cleanup
+        try:
+            if os.path.exists(temp_zip):
+                os.remove(temp_zip)
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
         DOWNLOADING = False
         cancel_flag = False
-        modal.destroy()
+        try:
+            modal.destroy()
+        except Exception:
+            pass
 
-
-# ABRIR MODAL
+# --- ABRIR MODAL ---
 def start_download_modal():
     selected = tree.selection()
     if not selected:
@@ -125,8 +244,11 @@ def start_download_modal():
     modal.grab_set()
     modal.geometry("400x220")
     modal.resizable(False, False)
-    modal.iconbitmap(os.path.abspath("icon.ico"))
-
+    # Se tiver icon.ico empacotado, pode funcionar; tratamos exceções
+    try:
+        modal.iconbitmap(os.path.abspath("icon.ico"))
+    except Exception:
+        pass
 
     status_text = tk.StringVar()
     status_text.set("Iniciando...")
@@ -143,7 +265,8 @@ def start_download_modal():
         global cancel_flag
         cancel_flag = True
         status_text.set("Cancelando...")
-        modal.destroy()
+        # não destruir modal imediatamente para mostrar progresso
+        # modal.destroy()
 
     cancel_btn = tk.Button(modal, text="Cancelar", command=cancel_operation)
     cancel_btn.pack(pady=10)
@@ -155,8 +278,7 @@ def start_download_modal():
         daemon=True
     ).start()
 
-
-# CARREGA MODS COM TRATAMENTO DE ERRO
+# --- CARREGA MODS COM TRATAMENTO DE ERRO ---
 def load_mods():
     global mods_list
     try:
@@ -172,8 +294,7 @@ def load_mods():
 
     update_treeview()
 
-
-# ATUALIZA TREEVIEW COM FILTRO DE PESQUISA
+# --- ATUALIZA TREEVIEW COM FILTRO DE PESQUISA ---
 def update_treeview(*args):
     search = search_var.get().lower()
     for i in tree.get_children():
@@ -182,12 +303,14 @@ def update_treeview(*args):
         if search in mod['name'].lower() or search in mod.get('description', '').lower():
             tree.insert("", "end", iid=idx, values=(mod['name'], mod.get('description', '')))
 
-
-# GUI
+# --- GUI ---
 root = tk.Tk()
 root.title("Instalador de Expansões ETS2 By valdemir")
 root.geometry("700x500")
-root.iconbitmap(os.path.abspath("icon.ico"))
+try:
+    root.iconbitmap(os.path.abspath("icon.ico"))
+except Exception:
+    pass
 
 main_frame = tk.Frame(root)
 main_frame.pack(fill="both", expand=True, padx=10, pady=10)
