@@ -1,0 +1,32 @@
+mods.{
+  "packages": [
+    {
+      "id": "1a2B3c4D5eF6gH7i8J9k",
+      "name": "Perfil BR Iniciante",
+      "description": "Perfil inicial do Euro Truck com caminhões básicos e rotas no Brasil.",
+      "game": "euro",
+      "type": "profile"
+    },
+    {
+      "id": "2b3C4d5E6fG7hH8i9J0k",
+      "name": "Pacote de Mods Realistas",
+      "description": "Conjunto de mods com tráfego realista, gráficos aprimorados e física melhorada.",
+      "game": "euro",
+      "type": "mod"
+    },
+    {
+      "id": "3c4D5e6F7gH8i9J0k1L2",
+      "name": "Combo Perfil + Mods American",
+      "description": "Pacote que inclui perfil configurado e mods de economia e caminhões para ATS.",
+      "game": "american",
+      "type": "both"
+    },
+    {
+      "id": "4d5E6f7G8hI9j0K1l2M3",
+      "name": "Som Realista de Caminhões",
+      "description": "Mod com sons de motor, freio e buzina mais realistas.",
+      "game": "american",
+      "type": "mod"
+    }
+  ]
+}
