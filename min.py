@@ -8,7 +8,8 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 import time
 import tempfile
-import math
+import ctypes
+import sys
 
 # Tente importar gdown (se não existir, seguiremos com fallback)
 try:
@@ -17,8 +18,42 @@ try:
 except Exception:
     HAVE_GDOWN = False
 
+# --- Função: detecção robusta da pasta Documents (Windows/Unix) ---
+def get_documents_folder():
+    """
+    Tenta obter a pasta 'Documents' de forma robusta:
+    1) usa Known Folders no Windows (se disponível)
+    2) tenta ~/Documents e ~/Documentos
+    3) fallback para ~/Documents
+    """
+    # Windows Known Folder (FOLDERID_Documents)
+    if sys.platform.startswith("win"):
+        try:
+            _SHGetKnownFolderPath = ctypes.windll.shell32.SHGetKnownFolderPath
+            _SHGetKnownFolderPath.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
+            _SHGetKnownFolderPath.restype = ctypes.c_long
+            # GUID for Documents as bytes
+            FOLDERID_Documents = ctypes.c_wchar_p("{FDD39AD0-238F-46AF-ADB4-6C85480369C7}")
+            ptr = ctypes.c_wchar_p()
+            res = _SHGetKnownFolderPath(ctypes.byref(ctypes.create_unicode_buffer("{FDD39AD0-238F-46AF-ADB4-6C85480369C7}")), 0, 0, ctypes.byref(ptr))
+            # se falhar, vamos pros próximos
+            if res == 0 and ptr.value:
+                return ptr.value
+        except Exception:
+            pass
+
+    # try common names
+    home = os.path.expanduser("~")
+    for candidate in ("Documents", "Documentos", "Meus Documentos"):
+        path = os.path.join(home, candidate)
+        if os.path.isdir(path):
+            return path
+
+    # fallback
+    return os.path.join(home, "Documents")
+
 # DETECTA DOCUMENTS E ETS2
-DOCUMENTS_FOLDER = os.path.join(os.path.expanduser("~"), "Documents")
+DOCUMENTS_FOLDER = get_documents_folder()
 EUROTRUCK_PATH = os.path.join(DOCUMENTS_FOLDER, "Euro Truck Simulator 2")
 MODS_FOLDER = os.path.join(EUROTRUCK_PATH, "mod")
 PROFILES_FOLDER = os.path.join(EUROTRUCK_PATH, "profiles")
@@ -27,7 +62,7 @@ PROFILES_FOLDER = os.path.join(EUROTRUCK_PATH, "profiles")
 os.makedirs(MODS_FOLDER, exist_ok=True)
 os.makedirs(PROFILES_FOLDER, exist_ok=True)
 
-# NOVO LINK
+# NOVO LINK (exemplo: substitua se quiser)
 JSON_URL = "https://raw.githubusercontent.com/DIY-Steering-Wheel/ETS__mod_hub/refs/heads/main/mods.json"
 
 DOWNLOADING = False
@@ -80,25 +115,21 @@ def robust_download(url, out_path, progress_callback=None, status_text=None, ret
                 root.update_idletasks()
 
             if is_google_drive_link(url) and HAVE_GDOWN:
-                # gdown retorna True/arquivo; usar quiet=True para não poluir
-                # gdown trata confirm prompts para arquivos grandes
                 try:
+                    # gdown lida com confirm prompts para arquivos grandes
                     gdown.download(url, out_path, quiet=True)
-                    # verifique se arquivo foi realmente criado
                     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                         if progress_callback:
-                            # não temos total, marque 100%
                             progress_callback(1, 1)
                         return True
                     else:
                         raise RuntimeError("gdown baixou arquivo vazio.")
                 except Exception as e:
                     last_exception = e
-                    # fallback para requests se gdown falhar
                     if status_text:
                         status_text.set("gdown falhou, tentando fallback com requests...")
-                    # continue para bloco requests abaixo
-            # fallback / link comum: requests streaming
+                    # cair para requests
+            # fallback: requests
             success = download_with_requests(url, out_path, progress_callback=progress_callback)
             if success:
                 return True
@@ -106,9 +137,61 @@ def robust_download(url, out_path, progress_callback=None, status_text=None, ret
             last_exception = e
             if status_text:
                 status_text.set(f"Erro: {e}. Retentando...")
-            time.sleep(1 + attempt)  # backoff simples
-    # todas as tentativas falharam
+            time.sleep(1 + attempt)
     raise last_exception if last_exception is not None else RuntimeError("Falha desconhecida no download.")
+
+# --- util: copia tudo que estiver dentro de pastas 'mods'/'mod' e 'perfil'/'profile' encontradas ---
+def copy_all_from_named_folders(extracted_root):
+    """
+    Varre extracted_root procurando por pastas com nomes:
+    - mods, mod  -> copia TODO o conteúdo dessas pastas (arquivos e subpastas) para MODS_FOLDER
+    - perfil, profile, profiles -> copia TODO o conteúdo dessas pastas (ou a pasta inteira) para PROFILES_FOLDER
+
+    Retorna um dicionário com o que foi copiado para exibição.
+    """
+    copied = {"mods_files": [], "mods_folders": [], "profiles": []}
+
+    # procura recursivamente por qualquer pasta cujo nome seja igual a uma das chaves
+    for root_dir, dirs, files in os.walk(extracted_root):
+        # verificar cada subpasta
+        for d in list(dirs):  # list() para evitar alteração enquanto itera
+            lower = d.lower()
+            full_d_path = os.path.join(root_dir, d)
+            try:
+                if lower in ("mods", "mod"):
+                    # copiar tudo que está DENTRO desta pasta para MODS_FOLDER
+                    for item in os.listdir(full_d_path):
+                        src = os.path.join(full_d_path, item)
+                        dest = os.path.join(MODS_FOLDER, item)
+                        if os.path.isdir(src):
+                            # copia pasta inteira (mergear caso exista)
+                            shutil.copytree(src, dest, dirs_exist_ok=True)
+                            copied["mods_folders"].append(dest)
+                        else:
+                            # arquivo simples
+                            shutil.copy2(src, dest)
+                            copied["mods_files"].append(dest)
+                elif lower in ("perfil", "profile", "profiles"):
+                    # copiar TUDO DENTRO dessa pasta para a pasta de profiles
+                    # se a pasta dentro do zip já tiver o nome do profile, vamos criar pasta com esse nome dentro de PROFILES_FOLDER
+                    for item in os.listdir(full_d_path):
+                        src = os.path.join(full_d_path, item)
+                        dest = os.path.join(PROFILES_FOLDER, item)
+                        if os.path.isdir(src):
+                            shutil.copytree(src, dest, dirs_exist_ok=True)
+                            copied["profiles"].append(dest)
+                        else:
+                            # arquivo solto dentro da pasta profile -> colocamos dentro de uma pasta chamada pelo nome da pasta d
+                            container_dir = os.path.join(PROFILES_FOLDER, d)
+                            os.makedirs(container_dir, exist_ok=True)
+                            dest_file = os.path.join(container_dir, item)
+                            shutil.copy2(src, dest_file)
+                            copied["profiles"].append(dest_file)
+            except Exception as e:
+                # continuar a busca mesmo que algum copy falhe
+                print("Erro ao copiar", full_d_path, e)
+
+    return copied
 
 # --- função principal de download e instalação ---
 def download_and_install(mod, status_text, modal, progress_bar, cancel_btn):
@@ -138,7 +221,10 @@ def download_and_install(mod, status_text, modal, progress_bar, cancel_btn):
                 progress_bar["value"] = percent
             else:
                 # sem total conhecido: anima a barra incrementalmente
-                progress_bar.step(5)
+                try:
+                    progress_bar.step(5)
+                except Exception:
+                    pass
             root.update_idletasks()
 
         try:
@@ -173,39 +259,54 @@ def download_and_install(mod, status_text, modal, progress_bar, cancel_btn):
                 if cancel_flag:
                     status_text.set("Cancelando extração...")
                     return
+                # evita caminhos com traversal
+                safe_name = os.path.normpath(file)
+                if safe_name.startswith(".."):
+                    continue
                 zip_ref.extract(file, tmp_dir)
                 if total_files > 0:
                     progress_bar["value"] = (i / total_files) * 100
                 else:
-                    progress_bar.step(5)
+                    try:
+                        progress_bar.step(5)
+                    except Exception:
+                        pass
                 root.update_idletasks()
 
-        temp_mod_path = os.path.join(tmp_dir, "")
+        if cancel_flag:
+            status_text.set("Operação cancelada")
+            return
 
-        # Instalar mods (procura pasta 'mods' dentro do zip)
-        mods_path = os.path.join(tmp_dir, "mods")
-        if os.path.exists(mods_path):
-            for item in os.listdir(mods_path):
-                s = os.path.join(mods_path, item)
-                d = os.path.join(MODS_FOLDER, item)
-                if os.path.isdir(s):
-                    shutil.copytree(s, d, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(s, d)
+        # --- NOVO: copiar TUDO que estiver dentro de pastas chamadas mods/mod/perfil/profile/profiles ---
+        status_text.set("Instalando arquivos (copiando pastas 'mods'/'perfil')...")
+        root.update_idletasks()
 
-        # Instalar perfis
-        perfil_path = os.path.join(tmp_dir, "perfil")
-        if os.path.exists(perfil_path):
-            for item in os.listdir(perfil_path):
-                s = os.path.join(perfil_path, item)
-                d = os.path.join(PROFILES_FOLDER, item)
-                if os.path.isdir(s):
-                    shutil.copytree(s, d, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(s, d)
+        copied_info = copy_all_from_named_folders(tmp_dir)
 
-        status_text.set("Instalação concluída!")
-        messagebox.showinfo("Concluído", f"{mod['name']} instalado com sucesso!")
+        # Se nada foi copiado, avisar (mas NÃO tentar heurísticas extras — você pediu para copiar apenas o conteúdo de pastas nomeadas)
+        if not copied_info["mods_files"] and not copied_info["mods_folders"] and not copied_info["profiles"]:
+            status_text.set("Nenhuma pasta 'mods' ou 'perfil' encontrada no pacote. Nada copiado.")
+            root.update_idletasks()
+            messagebox.showwarning("Aviso", "Não foi encontrada nenhuma pasta chamada 'mods' ou 'perfil' dentro do pacote. Nada foi copiado automaticamente.")
+        else:
+            # sumário para o usuário
+            summary_lines = []
+            if copied_info["mods_files"]:
+                summary_lines.append("Arquivos copiados para mod/:")
+                for p in copied_info["mods_files"]:
+                    summary_lines.append("  - " + p)
+            if copied_info["mods_folders"]:
+                summary_lines.append("Pastas copiadas para mod/:")
+                for p in copied_info["mods_folders"]:
+                    summary_lines.append("  - " + p)
+            if copied_info["profiles"]:
+                summary_lines.append("Itens copiados para profiles/:")
+                for p in copied_info["profiles"]:
+                    summary_lines.append("  - " + p)
+
+            status_text.set("Instalação concluída!")
+            root.update_idletasks()
+            messagebox.showinfo("Concluído - Itens copiados", "\n".join(summary_lines))
 
     except Exception as e:
         status_text.set("Ocorreu um erro")
@@ -244,7 +345,6 @@ def start_download_modal():
     modal.grab_set()
     modal.geometry("400x220")
     modal.resizable(False, False)
-    # Se tiver icon.ico empacotado, pode funcionar; tratamos exceções
     try:
         modal.iconbitmap(os.path.abspath("icon.ico"))
     except Exception:
@@ -265,8 +365,6 @@ def start_download_modal():
         global cancel_flag
         cancel_flag = True
         status_text.set("Cancelando...")
-        # não destruir modal imediatamente para mostrar progresso
-        # modal.destroy()
 
     cancel_btn = tk.Button(modal, text="Cancelar", command=cancel_operation)
     cancel_btn.pack(pady=10)
